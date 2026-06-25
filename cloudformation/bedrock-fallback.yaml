@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'aws-hybrid-llm-stack - Bedrock fallback + model management Lambda'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
+  NetworkingStackName:
+    Type: String
+
+  ECSStackName:
+    Type: String
+
+  BedrockFallbackModel:
+    Type: String
+    Default: "anthropic.claude-3-haiku-20240307-v1:0"
+    AllowedValues:
+      - "anthropic.claude-3-haiku-20240307-v1:0"
+      - "anthropic.claude-3-sonnet-20240229-v1:0"
+      - "amazon.nova-lite-v1:0"
+      - "amazon.titan-text-express-v1"
+
+  ModelS3Bucket:
+    Type: String
+    Default: ""
+    Description: "Optional S3 bucket for pre-downloaded model artifacts (air-gap)"
+
+Resources:
+
+  # ── S3: model artifact store (air-gap support) ───────────────────
+  ModelArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "aws-hybrid-llm-models-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: aws-hybrid-llm-stack
+
+  # ── SSM: model config params ─────────────────────────────────────
+  DefaultModelParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/aws-hybrid-llm/${Environment}/default-model"
+      Type: String
+      Value: "llama3.2"
+
+  BedrockFallbackModelParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/aws-hybrid-llm/${Environment}/bedrock-fallback-model"
+      Type: String
+      Value: !Ref BedrockFallbackModel
+
+  FallbackEnabledParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/aws-hybrid-llm/${Environment}/bedrock-fallback-enabled"
+      Type: String
+      Value: "true"
+
+  FallbackTimeoutMsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/aws-hybrid-llm/${Environment}/local-timeout-ms"
+      Type: String
+      Value: "25000"
+      Description: "Local LLM timeout before Bedrock fallback triggers"
+
+  # ── IAM: Inference Proxy Lambda Role ────────────────────────────
+  InferenceProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hybrid-llm-${Environment}-inference-proxy-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: InferenceProxyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws-hybrid-llm/${Environment}/*"
+              - Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # ── Lambda: Inference Proxy ──────────────────────────────────────
+  # Sits between router and Ollama/Bedrock
+  # Handles: timeout detection, Bedrock fallback, warm-up
+  InferenceProxyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "hybrid-llm-${Environment}-inference-proxy"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt InferenceProxyRole.Arn
+      MemorySize: 512
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${NetworkingStackName}-ECSSecurityGroup"
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet1"
+          - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet2"
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SSM_PREFIX: !Sub "/aws-hybrid-llm/${Environment}"
+          OLLAMA_ENDPOINT:
+            Fn::ImportValue: !Sub "${ECSStackName}-InferenceEndpoint"
+          ECS_CLUSTER:
+            Fn::ImportValue: !Sub "${ECSStackName}-ClusterName"
+          ECS_SERVICE:
+            Fn::ImportValue: !Sub "${ECSStackName}-OllamaServiceName"
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "Placeholder"}
+      Tags:
+        - Key: Project
+          Value: aws-hybrid-llm-stack
+
+  # ── Lambda: Model Manager ─────────────────────────────────────────
+  # Handles model pull, warm-up, ECS scale-up on cold start
+  ModelManagerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "hybrid-llm-${Environment}-model-manager"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt InferenceProxyRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${NetworkingStackName}-ECSSecurityGroup"
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet1"
+          - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet2"
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          OLLAMA_ENDPOINT:
+            Fn::ImportValue: !Sub "${ECSStackName}-InferenceEndpoint"
+          ECS_CLUSTER:
+            Fn::ImportValue: !Sub "${ECSStackName}-ClusterName"
+          ECS_SERVICE:
+            Fn::ImportValue: !Sub "${ECSStackName}-OllamaServiceName"
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "Placeholder"}
+
+  # ── EventBridge: scheduled warm-up (prevent cold starts) ────────
+  WarmUpRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "hybrid-llm-${Environment}-warmup"
+      Description: "Keep Ollama warm with a lightweight ping every 5 min"
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Id: InferenceProxyWarmUp
+          Arn: !GetAtt InferenceProxyLambda.Arn
+          Input: '{"action": "warmup"}'
+
+  WarmUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InferenceProxyLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WarmUpRule.Arn
+
+  # ── CloudWatch: inference metrics dashboard ──────────────────────
+  InferenceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "hybrid-llm-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Inference Requests (Local vs Bedrock Fallback)",
+                "metrics": [
+                  ["aws-hybrid-llm", "LocalInferenceCount", "Environment", "${Environment}"],
+                  ["aws-hybrid-llm", "BedrockFallbackCount", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Inference Latency (ms)",
+                "metrics": [
+                  ["aws-hybrid-llm", "LocalInferenceLatency", "Environment", "${Environment}"],
+                  ["aws-hybrid-llm", "BedrockFallbackLatency", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "ECS Desired vs Running Tasks",
+                "metrics": [
+                  ["ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", "aws-hybrid-llm-${Environment}"],
+                  ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "aws-hybrid-llm-${Environment}"]
+                ],
+                "period": 60,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Timeout Rate",
+                "metrics": [
+                  ["aws-hybrid-llm", "LocalTimeoutCount", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+  # ── Alarms ───────────────────────────────────────────────────────
+  HighFallbackRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "hybrid-llm-${Environment}-high-fallback-rate"
+      AlarmDescription: "Local LLM falling back to Bedrock too frequently"
+      MetricName: BedrockFallbackCount
+      Namespace: aws-hybrid-llm
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  InferenceProxyArn:
+    Value: !GetAtt InferenceProxyLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-InferenceProxyArn"
+
+  ModelArtifactBucketName:
+    Value: !Ref ModelArtifactBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ModelArtifactBucket"

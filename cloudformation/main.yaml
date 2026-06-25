@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'aws-hybrid-llm-stack - Root stack. Deploy this for complete local LLM + Bedrock fallback.'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+
+  DefaultModel:
+    Type: String
+    Default: "llama3.2"
+    AllowedValues:
+      - "llama3.2"
+      - "llama3.2:1b"
+      - "mistral"
+      - "phi3"
+      - "gemma2:2b"
+    Description: "Local LLM model to run on Ollama"
+
+  BedrockFallbackModel:
+    Type: String
+    Default: "anthropic.claude-3-haiku-20240307-v1:0"
+    Description: "Bedrock model for fallback when local LLM times out"
+
+  TaskCpu:
+    Type: Number
+    Default: 4096
+    Description: "Fargate vCPU (4096 = 4 vCPU). Minimum 4096 for llama3.2"
+
+  TaskMemory:
+    Type: Number
+    Default: 16384
+    Description: "Fargate memory MB. Minimum 16384 for llama3.2"
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: "Initial Ollama task count. 0 = scale-to-zero (cold starts)"
+
+  AutoShutdownEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  IdleShutdownMinutes:
+    Type: Number
+    Default: 30
+
+  ArtifactBucket:
+    Type: String
+    Description: "S3 bucket with packaged CloudFormation templates"
+
+  VpcCidr:
+    Type: String
+    Default: "10.10.0.0/16"
+
+Resources:
+
+  NetworkingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${ArtifactBucket}/cloudformation/networking.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        VpcCidr: !Ref VpcCidr
+
+  ECSStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkingStack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${ArtifactBucket}/cloudformation/ecs-ollama.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        NetworkingStackName: !Select [1, !Split ["/", !Ref NetworkingStack]]
+        DefaultModel: !Ref DefaultModel
+        TaskCpu: !Ref TaskCpu
+        TaskMemory: !Ref TaskMemory
+        DesiredCount: !Ref DesiredCount
+        AutoShutdownEnabled: !Ref AutoShutdownEnabled
+        IdleShutdownMinutes: !Ref IdleShutdownMinutes
+
+  BedrockStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: ECSStack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${ArtifactBucket}/cloudformation/bedrock-fallback.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        NetworkingStackName: !Select [1, !Split ["/", !Ref NetworkingStack]]
+        ECSStackName: !Select [1, !Split ["/", !Ref ECSStack]]
+        BedrockFallbackModel: !Ref BedrockFallbackModel
+
+Outputs:
+  InferenceEndpoint:
+    Description: "Internal ALB endpoint — pass this to aws-ai-router as LocalLLMEndpoint"
+    Value: !GetAtt ECSStack.Outputs.InferenceEndpoint
+
+  InferenceProxyArn:
+    Description: "Lambda proxy ARN for direct invocation"
+    Value: !GetAtt BedrockStack.Outputs.InferenceProxyArn
+
+  DeployNote:
+    Value: !Sub |
+      Local LLM (${DefaultModel}) running on ECS Fargate.
+      Pass InferenceEndpoint to aws-ai-router stack as LocalLLMEndpoint parameter.

@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'aws-hybrid-llm-stack - ECS Fargate cluster running Ollama (local LLM)'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
+  NetworkingStackName:
+    Type: String
+
+  OllamaImage:
+    Type: String
+    Default: "ollama/ollama:latest"
+    Description: "Ollama Docker image — swap for ECR URI in air-gapped environments"
+
+  DefaultModel:
+    Type: String
+    Default: "llama3.2"
+    AllowedValues:
+      - "llama3.2"
+      - "llama3.2:1b"
+      - "mistral"
+      - "phi3"
+      - "gemma2:2b"
+    Description: "Model to pull on container startup"
+
+  TaskCpu:
+    Type: Number
+    Default: 4096
+    AllowedValues: [2048, 4096, 8192, 16384]
+    Description: "Fargate task CPU units (4096 = 4 vCPU)"
+
+  TaskMemory:
+    Type: Number
+    Default: 16384
+    AllowedValues: [8192, 16384, 32768, 61440]
+    Description: "Fargate task memory in MB (16384 = 16GB)"
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: "Number of Ollama tasks. Scale up for higher throughput."
+
+  AutoShutdownEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Scale to 0 when no requests for IdleMinutes"
+
+  IdleShutdownMinutes:
+    Type: Number
+    Default: 30
+    Description: "Minutes of inactivity before scaling to 0"
+
+Resources:
+
+  # ── ECR Repository (for custom Ollama image with pre-pulled model) ──
+  OllamaECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "aws-hybrid-llm-${Environment}/ollama"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 3 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": {"type": "expire"}
+              }
+            ]
+          }
+
+  # ── ECS Cluster ──────────────────────────────────────────────────
+  LLMCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "aws-hybrid-llm-${Environment}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: aws-hybrid-llm-stack
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudWatch Log Group ─────────────────────────────────────────
+  OllamaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws-hybrid-llm/${Environment}/ollama"
+      RetentionInDays: 30
+
+  # ── IAM: Task Execution Role ─────────────────────────────────────
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hybrid-llm-${Environment}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+
+  # ── IAM: Task Role ───────────────────────────────────────────────
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hybrid-llm-${Environment}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OllamaTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::aws-hybrid-llm-models-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws-hybrid-llm/${Environment}/*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # ── ECS Task Definition (Ollama) ─────────────────────────────────
+  OllamaTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "aws-hybrid-llm-${Environment}-ollama"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: ollama
+          Image: !Ref OllamaImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 11434
+              Protocol: tcp
+          Environment:
+            - Name: OLLAMA_HOST
+              Value: "0.0.0.0"
+            - Name: OLLAMA_MODELS
+              Value: "/models"
+          Command:
+            - "serve"
+          HealthCheck:
+            Command:
+              - "CMD-SHELL"
+              - "curl -f http://localhost:11434/api/tags || exit 1"
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OllamaLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ollama
+          MountPoints:
+            - SourceVolume: models
+              ContainerPath: /models
+              ReadOnly: false
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65536
+              HardLimit: 65536
+        # Sidecar: model puller — pulls model on startup, exits
+        - Name: model-init
+          Image: !Ref OllamaImage
+          Essential: false
+          DependsOn:
+            - ContainerName: ollama
+              Condition: HEALTHY
+          Command:
+            - "pull"
+            - !Ref DefaultModel
+          Environment:
+            - Name: OLLAMA_HOST
+              Value: "http://localhost:11434"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OllamaLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: model-init
+      Volumes:
+        - Name: models
+
+  # ── ALB ──────────────────────────────────────────────────────────
+  InferenceALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "hybrid-llm-${Environment}-alb"
+      Type: application
+      Scheme: internal
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${NetworkingStackName}-ALBSecurityGroup"
+      Subnets:
+        - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet2"
+
+  OllamaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "hybrid-llm-${Environment}-ollama"
+      Port: 11434
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkingStackName}-VpcId"
+      TargetType: ip
+      HealthCheckPath: "/api/tags"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      DeregistrationDelay: 30
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InferenceALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OllamaTargetGroup
+
+  # ── ECS Service ──────────────────────────────────────────────────
+  OllamaService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub "ollama-${Environment}"
+      Cluster: !Ref LLMCluster
+      TaskDefinition: !Ref OllamaTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${NetworkingStackName}-ECSSecurityGroup"
+          Subnets:
+            - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${NetworkingStackName}-PrivateSubnet2"
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: ollama
+          ContainerPort: 11434
+          TargetGroupArn: !Ref OllamaTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Project
+          Value: aws-hybrid-llm-stack
+
+  # ── Auto Scaling ─────────────────────────────────────────────────
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 5
+      MinCapacity: 0
+      ResourceId: !Sub "service/${LLMCluster}/${OllamaService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+
+  ScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "hybrid-llm-${Environment}-scale-out"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 120
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            MetricIntervalUpperBound: 50
+            ScalingAdjustment: 1
+          - MetricIntervalLowerBound: 50
+            ScalingAdjustment: 2
+
+  ScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "hybrid-llm-${Environment}-scale-in"
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 300
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+
+  # ── Idle shutdown (scale to 0 when no traffic) ───────────────────
+  IdleShutdownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AutoShutdownEnabled
+    Properties:
+      AlarmName: !Sub "hybrid-llm-${Environment}-idle-shutdown"
+      AlarmDescription: "No requests for idle period — scale to 0"
+      MetricName: RequestCount
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt InferenceALB.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: !Ref IdleShutdownMinutes
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ScaleInPolicy
+      TreatMissingData: notBreaching
+
+Conditions:
+  AutoShutdownEnabled: !Equals [!Ref AutoShutdownEnabled, "true"]
+
+Outputs:
+  InferenceEndpoint:
+    Description: "Internal ALB endpoint for Ollama inference"
+    Value: !Sub "http://${InferenceALB.DNSName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-InferenceEndpoint"
+
+  ClusterName:
+    Value: !Ref LLMCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  OllamaServiceName:
+    Value: !GetAtt OllamaService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-OllamaServiceName"
+
+  ECRRepositoryUri:
+    Value: !GetAtt OllamaECRRepo.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-ECRRepositoryUri"
